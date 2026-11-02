@@ -6,8 +6,10 @@ T3 Code ↔ OmniRoute Model & Provider Synchronizer
 Automates configuring OmniRoute as an active Claude-agent provider inside T3 Code
 and syncs models discovered from OmniRoute into T3 Code's model picker.
 
-Supports grouping thinking / reasoning effort levels (low, medium, high, xhigh, max)
-into an interactive dropdown under each base model rather than displaying them as separate models.
+Key Features:
+- Reasoning / Thinking level grouping (low, medium, high, xhigh, max dropdown)
+- Source distinction tags ([Anthropic] vs [Antigravity]) to easily differentiate upstream models
+- Safe timestamped backups of settings.json before any update
 """
 
 import argparse
@@ -18,7 +20,7 @@ import os
 import re
 import shutil
 import sys
-from typing import List, Set, Optional, Dict, Any, Union
+from typing import List, Set, Optional, Dict, Any
 
 SETTINGS_PATH = os.path.expanduser("~/.t3/userdata/settings.json")
 OMNIROUTE_CONFIG_PATH = os.path.expanduser("~/.omniroute/config.json")
@@ -76,22 +78,52 @@ def discover_models_from_profiles(pattern_filter: Optional[str] = None) -> List[
     return sorted(list(models))
 
 
-def format_model_name(slug: str) -> str:
-    """Generate a clean human-readable name for a model slug."""
+def get_source_label(slug: str) -> tuple[str, str]:
+    """Return (source_name, source_short_code) based on slug prefix."""
+    if slug.startswith("antigravity/"):
+        return "Antigravity", "AG"
+    elif slug.startswith("claude/"):
+        return "Anthropic", "Claude"
+    elif "/" in slug:
+        prefix = slug.split("/", 1)[0]
+        return prefix.capitalize(), prefix.upper()
+    return "Direct", "Direct"
+
+
+def format_model_name(slug: str, source_tag: str = "prefix") -> str:
+    """
+    Generate a clean human-readable name for a model slug with optional source tag.
+    Styles: 'prefix' ([Anthropic] Name), 'suffix' (Name (Anthropic)), 'bullet' (Anthropic • Name),
+            'short' ([AG] Name), 'none' (Name)
+    """
+    source_name, source_short = get_source_label(slug)
     raw = slug.split("/", 1)[-1]
+
+    # Format date if present, e.g. -20251001 -> (2025-10-01)
     date_match = re.search(r"-(\d{4})(\d{2})(\d{2})", raw)
     date_str = ""
     if date_match:
         date_str = f" ({date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)})"
         raw = raw[:date_match.start()]
-    # Convert version numbers like -5-5 to -5.5
+
+    # Format version numbers like -5-5 -> -5.5
     raw = re.sub(r"-(\d+)-(\d+)", r"-\1.\2", raw)
     parts = raw.split("-")
     cleaned = [p.capitalize() if not re.match(r"^\d+(\.\d+)?$", p) else p for p in parts]
-    return " ".join(cleaned) + date_str
+    base_name = " ".join(cleaned) + date_str
+
+    if source_tag == "prefix":
+        return f"[{source_name}] {base_name}"
+    elif source_tag == "short":
+        return f"[{source_short}] {base_name}"
+    elif source_tag == "suffix":
+        return f"{base_name} ({source_name})"
+    elif source_tag == "bullet":
+        return f"{source_name} • {base_name}"
+    return base_name
 
 
-def group_models_by_thinking(model_slugs: List[str]) -> List[Dict[str, Any]]:
+def group_models_by_thinking(model_slugs: List[str], source_tag: str = "prefix") -> List[Dict[str, Any]]:
     """
     Groups models with reasoning effort suffixes (-low, -medium, -high, -xhigh, -max)
     into a single CustomModelEntry with optionDescriptors for effort.
@@ -113,7 +145,7 @@ def group_models_by_thinking(model_slugs: List[str]) -> List[Dict[str, Any]]:
 
     entries = []
     for base_slug, efforts in sorted(groups.items()):
-        name = format_model_name(base_slug)
+        name = format_model_name(base_slug, source_tag=source_tag)
         if efforts:
             supported_efforts = [e for e in EFFORT_ORDER if e in efforts]
             default_effort = "medium" if "medium" in supported_efforts else supported_efforts[0]
@@ -201,7 +233,7 @@ def show_status():
     print(f"Custom Models: {len(custom_models)} registered")
     if custom_models:
         print("\nRegistered Models:")
-        for item in custom_models[:20]:
+        for item in custom_models[:25]:
             if isinstance(item, dict):
                 slug = item.get("slug", "unknown")
                 name = item.get("name", slug)
@@ -209,20 +241,20 @@ def show_status():
                 effort_opt = next((o for o in opts if o.get("id") == "effort"), None)
                 if effort_opt:
                     efforts = [c.get("id") for c in effort_opt.get("options", [])]
-                    print(f"  • {name} ({slug}) [Reasoning: {', '.join(efforts)}]")
+                    print(f"  • {name} [{slug}] (Reasoning: {', '.join(efforts)})")
                 else:
-                    print(f"  • {name} ({slug})")
+                    print(f"  • {name} [{slug}]")
             else:
                 print(f"  • {item}")
-        if len(custom_models) > 20:
-            print(f"  ... and {len(custom_models) - 20} more.")
+        if len(custom_models) > 25:
+            print(f"  ... and {len(custom_models) - 25} more.")
 
 
-def list_available_models(filter_pattern: Optional[str] = None, group_thinking: bool = True):
+def list_available_models(filter_pattern: Optional[str] = None, group_thinking: bool = True, source_tag: str = "prefix"):
     """List models discovered from OmniRoute Claude profiles."""
     raw_models = discover_models_from_profiles(filter_pattern)
     if group_thinking:
-        grouped = group_models_by_thinking(raw_models)
+        grouped = group_models_by_thinking(raw_models, source_tag=source_tag)
         print(f"=== Discovered {len(grouped)} Grouped OmniRoute Model(s) (from {len(raw_models)} raw profiles) ===")
         for item in grouped:
             slug = item["slug"]
@@ -231,9 +263,9 @@ def list_available_models(filter_pattern: Optional[str] = None, group_thinking: 
             effort_opt = next((o for o in opts if o.get("id") == "effort"), None)
             if effort_opt:
                 efforts = [c.get("id") for c in effort_opt.get("options", [])]
-                print(f"  • {name} ({slug}) [Reasoning: {', '.join(efforts)}]")
+                print(f"  • {name} [{slug}] (Reasoning: {', '.join(efforts)})")
             else:
-                print(f"  • {name} ({slug})")
+                print(f"  • {name} [{slug}]")
     else:
         print(f"=== Discovered {len(raw_models)} Raw OmniRoute Model(s) ===")
         for m in raw_models:
@@ -279,13 +311,15 @@ def build_provider_config(base_url: str, home_path: str, custom_models: List[Any
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync OmniRoute models into T3 Code settings with optional thinking level grouping."
+        description="Sync OmniRoute models into T3 Code settings with thinking level grouping and source tagging."
     )
     parser.add_argument("--status", action="store_true", help="Show current OmniRoute provider status in T3 Code")
     parser.add_argument("--list", action="store_true", help="List discovered OmniRoute models without modifying anything")
     parser.add_argument("--base-url", default=None, help=f"OmniRoute endpoint (default: auto-detected or {DEFAULT_BASE_URL})")
     parser.add_argument("--home-path", default=DEFAULT_HOME_PATH, help=f"Custom Claude home directory (default: {DEFAULT_HOME_PATH})")
-    parser.add_argument("--filter", default=None, help="Regex pattern to filter models (e.g. '^(anthropic|claude)/')")
+    parser.add_argument("--filter", default=None, help="Regex pattern to filter models (e.g. 'claude/|antigravity/.*claude')")
+    parser.add_argument("--source-tag", choices=["prefix", "suffix", "bullet", "short", "none"], default="prefix",
+                        help="How to distinguish upstream sources (e.g. [Anthropic] vs [Antigravity]). Default: prefix")
     parser.add_argument("--all", action="store_true", help="Load ALL available models (500+ models)")
     parser.add_argument("--replace", action="store_true", help="Replace customModels entirely instead of merging")
     parser.add_argument("--no-group-thinking", action="store_true", help="Do not group thinking levels; list each variant as separate model")
@@ -299,17 +333,18 @@ def main():
         return 0
 
     if args.list:
-        list_available_models(args.filter, group_thinking=group_thinking)
+        list_available_models(args.filter, group_thinking=group_thinking, source_tag=args.source_tag)
         return 0
 
     base_url = args.base_url or get_omniroute_base_url()
     print(f"[*] OmniRoute Base URL: {base_url}")
+    print(f"[*] Source tag style: {args.source_tag}")
 
     # Determine filter pattern
     pattern = args.filter
     if not args.all and not args.filter:
-        print("[*] No filter specified. Defaulting to '^(anthropic|claude)/'.")
-        pattern = r"^(anthropic|claude)/"
+        print("[*] No filter specified. Defaulting to 'claude/|antigravity/.*claude'.")
+        pattern = r"claude/|antigravity/.*claude"
 
     discovered_slugs = discover_models_from_profiles(pattern)
     print(f"[*] Discovered {len(discovered_slugs)} raw model profile(s) matching filter.")
@@ -318,7 +353,7 @@ def main():
         return 1
 
     if group_thinking:
-        models_to_register = group_models_by_thinking(discovered_slugs)
+        models_to_register = group_models_by_thinking(discovered_slugs, source_tag=args.source_tag)
         print(f"[*] Grouped into {len(models_to_register)} base model(s) with interactive Reasoning selectors.")
     else:
         models_to_register = discovered_slugs
@@ -358,13 +393,13 @@ def main():
         print(json.dumps(new_config, indent=2)[:1500])
         print(f"\nTotal models to be registered: {len(final_models)}")
         print("Sample models:")
-        for m in final_models[:15]:
+        for m in final_models[:20]:
             if isinstance(m, dict):
-                print(f"  • {m.get('name')} ({m.get('slug')})")
+                print(f"  • {m.get('name')} [{m.get('slug')}]")
             else:
                 print(f"  • {m}")
-        if len(final_models) > 15:
-            print(f"  ... and {len(final_models) - 15} more.")
+        if len(final_models) > 20:
+            print(f"  ... and {len(final_models) - 20} more.")
         return 0
 
     provider_instances["omniroute"] = new_config
