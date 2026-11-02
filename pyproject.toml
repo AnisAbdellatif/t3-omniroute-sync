@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "t3-omniroute-sync"
-version = "0.2.0"
+version = "0.3.0"
 description = "Sync OmniRoute models into T3 Code as a custom Claude provider"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -12,8 +12,13 @@ license = { text = "MIT" }
 authors = [{ name = "Anis Abdellatif" }]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
 ]
+
+[tool.setuptools]
+py-modules = ["sync"]
 
 [project.scripts]
 t3-omniroute-sync = "sync:main"

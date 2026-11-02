@@ -4,3 +4,11 @@ __pycache__/
 dist/
 build/
 .venv/
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.bak.*
+.env

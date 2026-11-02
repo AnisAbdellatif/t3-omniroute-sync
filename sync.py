@@ -43,6 +43,7 @@ except ImportError:  # pragma: no cover
 T3_SETTINGS_PATH = os.path.expanduser("~/.t3/userdata/settings.json")
 OMNIROUTE_CLI_CONFIG = os.path.expanduser("~/.omniroute/config.json")
 DEFAULT_HOME_PATH = "~/claude_omniroute"
+__version__ = "0.3.0"
 DEFAULT_PORT = 20128
 INSTANCE_ID = "omniroute"
 DISPLAY_NAME = "Omniroute"
@@ -53,6 +54,11 @@ PROVIDER_LABELS = {
     "antigravity": "Antigravity", "claude": "Anthropic", "openai": "OpenAI", "gemini": "Gemini",
     "github": "GitHub", "codex": "Codex", "openrouter": "OpenRouter", "deepseek": "DeepSeek",
 }
+PROVIDER_SHORT = {
+    "antigravity": "AG", "claude": "A", "openai": "OAI", "gemini": "G",
+    "github": "GH", "codex": "CX", "openrouter": "OR", "deepseek": "DS",
+}
+TAG_STYLES = ["prefix", "short-prefix", "suffix", "short-suffix", "none"]
 
 # --------------------------------------------------------------------------- #
 # Tiny UI helpers
@@ -312,9 +318,20 @@ def pretty_name(model_id: str) -> str:
     return " ".join(words) + date_str
 
 
+def provider_short(provider: str) -> str:
+    if provider in PROVIDER_SHORT:
+        return PROVIDER_SHORT[provider]
+    caps = "".join(c for c in provider_label(provider) if c.isupper())
+    return caps if len(caps) >= 2 else provider_label(provider)[:3].upper()
+
+
 def tagged_name(model_id: str, tag_style: str) -> str:
-    base, label = pretty_name(model_id), provider_label(provider_of(model_id))
-    return {"prefix": f"[{label}] {base}", "suffix": f"{base} ({label})", "none": base}.get(tag_style, f"[{label}] {base}")
+    base, provider = pretty_name(model_id), provider_of(model_id)
+    label, short = provider_label(provider), provider_short(provider)
+    return {
+        "prefix": f"[{label}] {base}", "short-prefix": f"[{short}] {base}",
+        "suffix": f"{base} ({label})", "short-suffix": f"{base} ({short})", "none": base,
+    }.get(tag_style, f"[{label}] {base}")
 
 
 def split_effort(model_id: str) -> Tuple[str, Optional[str]]:
@@ -367,9 +384,13 @@ def read_json(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except FileNotFoundError:
         return {}
+    except ValueError as e:
+        raise OmniRouteError(f"{path} isn't valid JSON ({e}). Fix or remove it, then run this again.")
+    if not isinstance(data, dict):
+        raise OmniRouteError(f"{path} has an unexpected format (expected a JSON object).")
+    return data
 
 
 def write_json_atomic(path: str, data: Dict[str, Any], mode: Optional[int] = None) -> None:
@@ -421,7 +442,7 @@ def saved_connection(home_path: str) -> Tuple[str, str]:
 def write_claude_home(home_path: str, base_url: str, api_key: str) -> str:
     """Create the Claude config dir and point its settings.json at OmniRoute."""
     home = os.path.expanduser(home_path)
-    os.makedirs(home, exist_ok=True)
+    os.makedirs(home, mode=0o700, exist_ok=True)  # holds the API key
     path = os.path.join(home, "settings.json")
     settings = read_json(path)
     env = settings.setdefault("env", {})
@@ -519,7 +540,10 @@ def pick_models(ids: List[str], args: argparse.Namespace) -> List[str]:
         by_provider.setdefault(provider_of(mid), []).append(mid)
 
     is_claude = lambda m: "claude" in m.lower()
-    pattern = re.compile(args.models, re.I) if args.models else None
+    try:
+        pattern = re.compile(args.models, re.I) if args.models else None
+    except re.error as e:
+        raise OmniRouteError(f"--models isn't a valid regex: {e}")
     wanted_providers = {p.strip() for p in args.providers.split(",")} if args.providers else None
 
     # --- providers ---
@@ -558,6 +582,17 @@ def pick_models(ids: List[str], args: argparse.Namespace) -> List[str]:
     return picked
 
 
+def pick_tag_style(sample_id: str) -> str:
+    print(bold("\n  How should model names show their provider?"))
+    for i, style in enumerate(TAG_STYLES, 1):
+        print(f"    {i}) {tagged_name(sample_id, style)}")
+    while True:
+        reply = ask("Choose a number", "1")
+        if reply.isdigit() and 1 <= int(reply) <= len(TAG_STYLES):
+            return TAG_STYLES[int(reply) - 1]
+        print(red("  Please type one of the numbers above."))
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     print(bold("\n  OmniRoute → T3 Code setup"))
     print(dim("  This connects T3 Code to your OmniRoute so you can pick its models in the model menu.\n"))
@@ -579,6 +614,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if not picked:
         print(red("  No models selected — nothing to do."))
         return 1
+    if args.source_tag is None:
+        args.source_tag = "prefix" if args.yes else pick_tag_style(picked[0])
     entries = build_entries(picked, catalog, args.source_tag, group=not args.no_group)
 
     step(5, 5, "Review and apply")
@@ -625,20 +662,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--providers", help="Comma-separated provider ids to include, e.g. antigravity,claude")
     p.add_argument("--models", help="Regex of model ids to include (default: Claude models)")
     p.add_argument("--all", action="store_true", help="Include every model of the chosen providers")
-    p.add_argument("--source-tag", choices=["prefix", "suffix", "none"], default="prefix", help="How to label the provider in model names")
+    p.add_argument("--source-tag", choices=TAG_STYLES, default=None, help="How to label the provider in model names (default: prefix; the wizard asks)")
     p.add_argument("--no-group", action="store_true", help="Don't fold reasoning levels into one model")
     p.add_argument("-y", "--yes", action="store_true", help="No questions: use flags/defaults")
     p.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--status", action="store_true", help="Show the current T3 Omniroute setup and exit")
     args = p.parse_args(argv)
     if os.environ.get("OMNIROUTE_API_KEY") and not args.key:
         args.key = os.environ["OMNIROUTE_API_KEY"]
 
-    if args.status:
-        return cmd_status()
     os.environ.setdefault("ESCDELAY", "25")
     try:
-        return cmd_setup(args)
+        return cmd_status() if args.status else cmd_setup(args)
     except (UserAbort, KeyboardInterrupt):
         print(yellow("\n  Cancelled — nothing was changed."))
         return 130
