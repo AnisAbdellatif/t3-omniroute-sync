@@ -464,6 +464,18 @@ def link_shared_assets(home_path: str, source_path: str = "~/.claude") -> List[s
     source = os.path.expanduser(source_path)
     if os.path.abspath(home) == os.path.abspath(source):
         return []
+
+    # Expose account-synced skills (e.g. ~/.claude/skills/synced/*/*) as top-level skills
+    for smd in glob.glob(os.path.join(source, "skills", "synced", "*", "*", "SKILL.md")):
+        sdir = os.path.dirname(smd)
+        sname = os.path.basename(sdir)
+        top = os.path.join(source, "skills", sname)
+        if not os.path.lexists(top):
+            try:
+                os.symlink(sdir, top)
+            except OSError:
+                pass
+
     linked: List[str] = []
     for item in SHAREABLE_ASSETS:
         src = os.path.join(source, item)

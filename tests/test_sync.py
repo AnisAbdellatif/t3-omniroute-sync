@@ -64,6 +64,19 @@ class AssetLinking(unittest.TestCase):
             linked2 = sync.link_shared_assets(dst, source_path=src)
             self.assertEqual(linked2, [])
 
+    def test_promote_synced_skills(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            typst_dir = os.path.join(src, "skills", "synced", "acc1", "typst")
+            os.makedirs(typst_dir)
+            with open(os.path.join(typst_dir, "SKILL.md"), "w") as f:
+                f.write("---\nname: typst\n---")
+
+            sync.link_shared_assets(dst, source_path=src)
+            top_typst = os.path.join(src, "skills", "typst")
+            self.assertTrue(os.path.islink(top_typst))
+            self.assertEqual(os.path.realpath(top_typst), os.path.realpath(typst_dir))
+
 
 if __name__ == "__main__":
     unittest.main()
