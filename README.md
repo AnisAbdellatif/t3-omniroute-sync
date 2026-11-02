@@ -1,86 +1,46 @@
-# t3-omniroute-sync 🚀
+# t3-omniroute-sync
 
-Bridge and synchronize AI models from **[OmniRoute](https://github.com/dvalov/omniroute)** into **T3 Code** as a dedicated provider instance.
-
----
-
-## 💡 Key Capabilities
-
-1. **Upstream Source Distinction (`--source-tag`)**:
-   - Clearly distinguishes between models routed through **Anthropic direct** vs **Antigravity**:
-     - `[Anthropic] Claude Sonnet 5.5`
-     - `[Antigravity] Claude Sonnet 5.5`
-   - Supports 5 customizable tagging formats:
-     - `prefix`: `[Anthropic] Claude Sonnet 5.5` *(default)*
-     - `short`: `[Claude] Claude Sonnet 5.5` vs `[AG] Claude Sonnet 5.5`
-     - `suffix`: `Claude Sonnet 5.5 (Anthropic)` vs `Claude Sonnet 5.5 (Antigravity)`
-     - `bullet`: `Anthropic • Claude Sonnet 5.5` vs `Antigravity • Claude Sonnet 5.5`
-     - `none`: Clean names without source labels
-
-2. **Reasoning / Thinking Level Grouping**:
-   - Rather than creating 5-6 redundant entries in the UI for every model (`-low`, `-medium`, `-high`, `-xhigh`, `-max`), `t3-omniroute-sync` detects these suffixes and collapses them into **one base model** with an interactive **Reasoning (Effort)** selector dropdown directly in T3 Code!
-
-3. **Safe Backups**:
-   - Automatic timestamped backups saved to `~/.t3/userdata/settings.json.bak.<timestamp>`.
-
----
-
-## 📦 Installation
+Connect **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)** to **T3 Code** with a friendly step-by-step wizard.
+No packages to install — just Python 3.8+ (already on macOS/Linux).
 
 ```bash
-cd ~/dev/t3-omniroute-sync
+python3 sync.py
 ```
 
-Optionally install as a global CLI command:
-```bash
-pip install -e .
-```
-Now you can run `t3-omniroute-sync` directly from any terminal.
+The wizard asks you for:
 
----
+1. **Your OmniRoute address** — e.g. `192.168.1.20:20128` or `http://localhost:20128`
+2. **Your API key** (typing is hidden)
+3. **Which providers** you want (arrow keys + `space`, `a` = all, `n` = none, `/` = search)
+4. **Which models** you want (Claude models are pre-selected)
 
-## ⚡ Quick Start
+Then it creates the `~/claude_omniroute` folder, saves your credentials there (private, mode 600) and adds an
+**Omniroute** provider to T3 Code. Open T3 Code's model menu and pick an Omniroute model
+(restart T3 Code if it doesn't appear). Your old T3 settings are backed up first
+(`~/.t3/userdata/settings.json.bak.<time>`), and nothing is changed if you cancel.
 
-### 1. Check current status in T3 Code
-```bash
-./sync.py --status
-```
+Run it again any time to add or remove models — your address and key are remembered.
 
-### 2. List grouped models discovered from OmniRoute
-```bash
-./sync.py --list
-```
+## Why you only see models that work
 
-### 3. Sync all Claude models (Anthropic + Antigravity) with prefix tags (Recommended)
-```bash
-./sync.py --filter "^(claude/|antigravity/.*claude)" --replace
-```
+Models come from OmniRoute's **live** `/v1/models` list, not from guesses. Reasoning levels
+(`-low`/`-medium`/`-high`…) are folded into one model with a *Reasoning* dropdown only when the plain model really
+exists on your server; otherwise each level is listed on its own. This avoids errors like
+`Model '…' is not available in the active live catalog`.
 
-### 4. Use different tagging styles
-```bash
-# Suffix style: Claude Sonnet 5.5 (Antigravity)
-./sync.py --filter "^(claude/|antigravity/.*claude)" --source-tag suffix --replace
+## Advanced / scripting
 
-# Bullet style: Antigravity • Claude Sonnet 5.5
-./sync.py --filter "^(claude/|antigravity/.*claude)" --source-tag bullet --replace
+| Option | Meaning |
+|---|---|
+| `--status` | Show the current T3 Omniroute setup |
+| `--dry-run` | Show what would change, write nothing |
+| `-y`, `--yes` | No questions; use the flags below |
+| `--url`, `--key` | Address / key (key can also come from `OMNIROUTE_API_KEY`) |
+| `--providers a,b` | Only these provider ids (e.g. `antigravity,claude`) |
+| `--models REGEX` | Only model ids matching this regex (default: Claude models) |
+| `--all` | Every model of the chosen providers |
+| `--home-path DIR` | Claude config folder (default `~/claude_omniroute`) |
+| `--source-tag prefix\|suffix\|none` | Label style, e.g. `[Antigravity] Claude Sonnet 4.6` |
+| `--no-group` | Don't fold reasoning levels into one model |
 
-# Short style: [AG] Claude Sonnet 5.5 vs [Claude] Claude Sonnet 5.5
-./sync.py --filter "^(claude/|antigravity/.*claude)" --source-tag short --replace
-```
-
----
-
-## 🛠️ CLI Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--source-tag <style>` | Tagging style: `prefix`, `short`, `suffix`, `bullet`, `none` | `prefix` |
-| `--status` | Print current OmniRoute provider status in T3 Code | — |
-| `--list` | Print discovered OmniRoute models without modifying settings | — |
-| `--dry-run` | Preview configuration without touching disk | — |
-| `--filter <regex>` | Filter model names with a regular expression | `"claude/\|antigravity/.*claude"` |
-| `--all` | Include all discovered models (500+) | `False` |
-| `--replace` | Overwrite `customModels` instead of merging with existing | `False` |
-| `--no-group-thinking` | Keep each thinking level as a separate model entry | `False` (grouped by default) |
-| `--base-url <url>` | Override OmniRoute API base URL | Auto-detected from `~/.omniroute/config.json` |
-| `--home-path <dir>` | Claude Code home directory for OmniRoute | `~/.claude-omniroute` |
+Example: `python3 sync.py -y --url 192.168.1.20 --key sk-… --providers antigravity`

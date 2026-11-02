@@ -1,421 +1,650 @@
 #!/usr/bin/env python3
 """
-T3 Code ↔ OmniRoute Model & Provider Synchronizer
-=================================================
+t3-omniroute-sync — set up OmniRoute as a provider in T3 Code.
 
-Automates configuring OmniRoute as an active Claude-agent provider inside T3 Code
-and syncs models discovered from OmniRoute into T3 Code's model picker.
+Just run:   python3 sync.py
 
-Key Features:
-- Reasoning / Thinking level grouping (low, medium, high, xhigh, max dropdown)
-- Source distinction tags ([Anthropic] vs [Antigravity]) to easily differentiate upstream models
-- Safe timestamped backups of settings.json before any update
+The wizard will:
+  1. ask for your OmniRoute address and API key
+  2. fetch the models your OmniRoute actually serves (live catalog)
+  3. let you tick the providers / models you want (arrow keys + space)
+  4. create the ~/claude_omniroute folder and register an "Omniroute"
+     Claude provider in T3 Code (with a backup of your T3 settings)
+
+Only the Python 3.8+ standard library is used — nothing to install.
 """
+
+from __future__ import annotations
 
 import argparse
 import datetime
+import getpass
 import glob
 import json
 import os
 import re
 import shutil
 import sys
-from typing import List, Set, Optional, Dict, Any
+import tempfile
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
-SETTINGS_PATH = os.path.expanduser("~/.t3/userdata/settings.json")
-OMNIROUTE_CONFIG_PATH = os.path.expanduser("~/.omniroute/config.json")
-CLAUDE_PROFILES_DIR = os.path.expanduser("~/.claude/profiles")
-DEFAULT_BASE_URL = "http://100.66.176.99:20128"
-DEFAULT_HOME_PATH = "~/.claude-omniroute"
+try:  # curses is missing on some Windows Pythons; we fall back to plain prompts
+    import curses
+except ImportError:  # pragma: no cover
+    curses = None  # type: ignore
+
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+
+T3_SETTINGS_PATH = os.path.expanduser("~/.t3/userdata/settings.json")
+OMNIROUTE_CLI_CONFIG = os.path.expanduser("~/.omniroute/config.json")
+DEFAULT_HOME_PATH = "~/claude_omniroute"
+DEFAULT_PORT = 20128
+INSTANCE_ID = "omniroute"
+DISPLAY_NAME = "Omniroute"
 
 EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
-EFFORT_LABELS = {
-    "low": "Low",
-    "medium": "Medium",
-    "high": "High",
-    "xhigh": "Extra High",
-    "max": "Max"
+EFFORT_LABELS = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra High", "max": "Max"}
+PROVIDER_LABELS = {
+    "antigravity": "Antigravity", "claude": "Anthropic", "openai": "OpenAI", "gemini": "Gemini",
+    "github": "GitHub", "codex": "Codex", "openrouter": "OpenRouter", "deepseek": "DeepSeek",
 }
 
+# --------------------------------------------------------------------------- #
+# Tiny UI helpers
+# --------------------------------------------------------------------------- #
 
-def get_omniroute_base_url() -> str:
-    """Detect OmniRoute base URL from ~/.omniroute/config.json if available."""
-    if os.path.exists(OMNIROUTE_CONFIG_PATH):
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLOR else text
+
+
+def bold(t: str) -> str: return _c("1", t)
+def dim(t: str) -> str: return _c("2", t)
+def green(t: str) -> str: return _c("32", t)
+def red(t: str) -> str: return _c("31", t)
+def cyan(t: str) -> str: return _c("36", t)
+def yellow(t: str) -> str: return _c("33", t)
+
+
+class UserAbort(Exception):
+    pass
+
+
+def step(n: int, total: int, title: str) -> None:
+    print(f"\n{cyan(f'Step {n}/{total}')} {bold(title)}")
+
+
+def ask(question: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"  {question}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise UserAbort()
+    return answer or default
+
+
+def ask_secret(question: str) -> str:
+    try:
+        return getpass.getpass(f"  {question}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise UserAbort()
+
+
+def confirm(question: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    answer = ask(f"{question} ({hint})").lower()
+    return default if not answer else answer.startswith("y")
+
+
+def mask(key: str) -> str:
+    return key[:6] + "…" + key[-3:] if len(key) > 12 else "…" * bool(key)
+
+
+# --------------------------------------------------------------------------- #
+# Checklist widget (curses with plain-text fallback)
+# --------------------------------------------------------------------------- #
+
+Item = Tuple[str, str, str]  # (key, label, detail)
+
+
+def checklist(title: str, subtitle: str, items: List[Item], selected: set) -> set:
+    """Let the user tick items. Returns the set of selected keys."""
+    if not items:
+        return set()
+    selected = set(selected)
+    if curses and sys.stdin.isatty() and sys.stdout.isatty():
         try:
-            with open(OMNIROUTE_CONFIG_PATH) as f:
-                data = json.load(f)
-                current_context = data.get("currentContext", "default")
-                contexts = data.get("contexts", {})
-                if current_context in contexts:
-                    base_url = contexts[current_context].get("baseUrl")
-                    if base_url:
-                        return base_url
-        except Exception as e:
-            print(f"[!] Warning reading {OMNIROUTE_CONFIG_PATH}: {e}", file=sys.stderr)
-    return DEFAULT_BASE_URL
+            return curses.wrapper(_curses_checklist, title, subtitle, items, selected)
+        except curses.error:
+            pass  # terminal too small / unsupported -> plain mode
+    return _text_checklist(title, subtitle, items, selected)
 
 
-def discover_models_from_profiles(pattern_filter: Optional[str] = None) -> List[str]:
-    """Extract model IDs from ~/.claude/profiles/*/settings.json."""
-    if not os.path.exists(CLAUDE_PROFILES_DIR):
-        return []
+def _curses_checklist(stdscr, title, subtitle, items: List[Item], selected: set) -> set:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    cursor, top, query, filtering = 0, 0, "", False
 
-    profile_files = glob.glob(os.path.join(CLAUDE_PROFILES_DIR, "*/settings.json"))
-    models: Set[str] = set()
-    for pf in profile_files:
-        try:
-            with open(pf) as f:
-                data = json.load(f)
-                m = data.get("model") or data.get("env", {}).get("ANTHROPIC_MODEL")
-                if m:
-                    if pattern_filter:
-                        if re.search(pattern_filter, m, re.IGNORECASE):
-                            models.add(m)
-                    else:
-                        models.add(m)
-        except Exception:
+    def visible() -> List[Item]:
+        q = query.lower()
+        return [it for it in items if q in it[1].lower() or q in it[0].lower()] if q else items
+
+    while True:
+        shown = visible()
+        cursor = max(0, min(cursor, len(shown) - 1)) if shown else 0
+        h, w = stdscr.getmaxyx()
+        body_h = max(1, h - 6)
+        if cursor < top:
+            top = cursor
+        if cursor >= top + body_h:
+            top = cursor - body_h + 1
+
+        stdscr.erase()
+        stdscr.addnstr(0, 0, title, w - 1, curses.A_BOLD)
+        stdscr.addnstr(1, 0, subtitle, w - 1, curses.A_DIM)
+        flt = f"Filter: {query}{'_' if filtering else ''}" if (query or filtering) else "Press / to search"
+        stdscr.addnstr(2, 0, f"{flt}    ({len(selected)} of {len(items)} selected)", w - 1)
+        for row, it in enumerate(shown[top: top + body_h]):
+            idx = top + row
+            box = "[x]" if it[0] in selected else "[ ]"
+            line = f" {box} {it[1]}"
+            if it[2]:
+                line += f"  — {it[2]}"
+            attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
+            stdscr.addnstr(3 + row, 0, line, w - 1, attr)
+        if not shown:
+            stdscr.addnstr(3, 0, "  (nothing matches your filter)", w - 1, curses.A_DIM)
+        stdscr.addnstr(h - 2, 0, "↑/↓ move   SPACE tick   a all   n none   / search   ENTER done   q cancel", w - 1, curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if filtering:
+            if key in (10, 13, 27):
+                filtering = False
+                if key == 27:
+                    query = ""
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                query = query[:-1]
+            elif 32 <= key < 127:
+                query += chr(key)
+            cursor = top = 0
             continue
-    return sorted(list(models))
+        if key in (curses.KEY_UP, ord("k")):
+            cursor -= 1
+        elif key in (curses.KEY_DOWN, ord("j")):
+            cursor += 1
+        elif key == curses.KEY_PPAGE:
+            cursor -= body_h
+        elif key == curses.KEY_NPAGE:
+            cursor += body_h
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = len(shown) - 1
+        elif key == ord(" ") and shown:
+            selected.symmetric_difference_update({shown[cursor][0]})
+            cursor += 1
+        elif key == ord("a"):
+            selected.update(it[0] for it in shown)
+        elif key == ord("n"):
+            selected.difference_update(it[0] for it in shown)
+        elif key == ord("/"):
+            filtering = True
+        elif key in (10, 13, curses.KEY_ENTER):
+            return selected
+        elif key in (ord("q"), 3):
+            raise UserAbort()
 
 
-def get_source_label(slug: str) -> tuple[str, str]:
-    """Return (source_name, source_short_code) based on slug prefix."""
-    if slug.startswith("antigravity/"):
-        return "Antigravity", "AG"
-    elif slug.startswith("claude/"):
-        return "Anthropic", "Claude"
-    elif "/" in slug:
-        prefix = slug.split("/", 1)[0]
-        return prefix.capitalize(), prefix.upper()
-    return "Direct", "Direct"
-
-
-def format_model_name(slug: str, source_tag: str = "prefix") -> str:
-    """
-    Generate a clean human-readable name for a model slug with optional source tag.
-    Styles: 'prefix' ([Anthropic] Name), 'suffix' (Name (Anthropic)), 'bullet' (Anthropic • Name),
-            'short' ([AG] Name), 'none' (Name)
-    """
-    source_name, source_short = get_source_label(slug)
-    raw = slug.split("/", 1)[-1]
-
-    # Format date if present, e.g. -20251001 -> (2025-10-01)
-    date_match = re.search(r"-(\d{4})(\d{2})(\d{2})", raw)
-    date_str = ""
-    if date_match:
-        date_str = f" ({date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)})"
-        raw = raw[:date_match.start()]
-
-    # Format version numbers like -5-5 -> -5.5
-    raw = re.sub(r"-(\d+)-(\d+)", r"-\1.\2", raw)
-    parts = raw.split("-")
-    cleaned = [p.capitalize() if not re.match(r"^\d+(\.\d+)?$", p) else p for p in parts]
-    base_name = " ".join(cleaned) + date_str
-
-    if source_tag == "prefix":
-        return f"[{source_name}] {base_name}"
-    elif source_tag == "short":
-        return f"[{source_short}] {base_name}"
-    elif source_tag == "suffix":
-        return f"{base_name} ({source_name})"
-    elif source_tag == "bullet":
-        return f"{source_name} • {base_name}"
-    return base_name
-
-
-def group_models_by_thinking(model_slugs: List[str], source_tag: str = "prefix") -> List[Dict[str, Any]]:
-    """
-    Groups models with reasoning effort suffixes (-low, -medium, -high, -xhigh, -max)
-    into a single CustomModelEntry with optionDescriptors for effort.
-    """
-    groups: Dict[str, Set[str]] = {}
-    for m in model_slugs:
-        matched_effort = None
-        for eff in EFFORT_ORDER:
-            suffix = f"-{eff}"
-            if m.endswith(suffix):
-                matched_effort = eff
-                base_slug = m[:-len(suffix)]
-                break
-        if not matched_effort:
-            base_slug = m
-        groups.setdefault(base_slug, set())
-        if matched_effort:
-            groups[base_slug].add(matched_effort)
-
-    entries = []
-    for base_slug, efforts in sorted(groups.items()):
-        name = format_model_name(base_slug, source_tag=source_tag)
-        if efforts:
-            supported_efforts = [e for e in EFFORT_ORDER if e in efforts]
-            default_effort = "medium" if "medium" in supported_efforts else supported_efforts[0]
-            options = []
-            for e in supported_efforts:
-                opt = {"id": e, "label": EFFORT_LABELS[e]}
-                if e == default_effort:
-                    opt["isDefault"] = True
-                options.append(opt)
-
-            entry = {
-                "slug": base_slug,
-                "name": name,
-                "capabilities": {
-                    "optionDescriptors": [
-                        {
-                            "id": "effort",
-                            "label": "Reasoning",
-                            "type": "select",
-                            "options": options
-                        }
-                    ]
-                }
-            }
+def _text_checklist(title: str, subtitle: str, items: List[Item], selected: set) -> set:
+    print(f"\n  {bold(title)}\n  {dim(subtitle)}")
+    while True:
+        for i, (key, label, detail) in enumerate(items, 1):
+            box = green("[x]") if key in selected else "[ ]"
+            print(f"  {i:>3}. {box} {label}" + (dim(f"  — {detail}") if detail else ""))
+        reply = ask("Type numbers to toggle (e.g. 1 3 5-8), 'a' = all, 'n' = none, Enter = done").lower()
+        if not reply:
+            return selected
+        if reply == "a":
+            selected = {it[0] for it in items}
+        elif reply == "n":
+            selected = set()
         else:
-            entry = {
-                "slug": base_slug,
-                "name": name
-            }
-        entries.append(entry)
+            for tok in reply.replace(",", " ").split():
+                m = re.fullmatch(r"(\d+)(?:-(\d+))?", tok)
+                if not m:
+                    print(red(f"  Didn't understand '{tok}'"))
+                    continue
+                lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+                for n in range(lo, hi + 1):
+                    if 1 <= n <= len(items):
+                        selected.symmetric_difference_update({items[n - 1][0]})
+
+
+# --------------------------------------------------------------------------- #
+# OmniRoute access
+# --------------------------------------------------------------------------- #
+
+class OmniRouteError(Exception):
+    pass
+
+
+def normalize_url(raw: str) -> str:
+    """'100.1.2.3', 'localhost:20128', 'http://host:20128/v1/' -> 'http://host:20128'."""
+    raw = raw.strip().rstrip("/")
+    if not raw:
+        raise OmniRouteError("The address is empty.")
+    had_scheme = "://" in raw
+    if not had_scheme:
+        raw = "http://" + raw
+    raw = re.sub(r"/(v1|api)(/.*)?$", "", raw)
+    parsed = urlparse(raw)
+    if not parsed.hostname:
+        raise OmniRouteError(f"'{raw}' doesn't look like an address.")
+    host = parsed.hostname
+    looks_local = host == "localhost" or re.fullmatch(r"[\d.]+", host) or ":" in host or "." not in host
+    if not had_scheme and parsed.port is None and looks_local:
+        raw += f":{DEFAULT_PORT}"
+    return raw
+
+
+def fetch_models(base_url: str, api_key: str, timeout: float = 15.0) -> List[str]:
+    """Return the model ids OmniRoute serves (GET /v1/models)."""
+    req = urllib.request.Request(
+        base_url + "/v1/models",
+        headers={"Authorization": f"Bearer {api_key}", "x-api-key": api_key, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise OmniRouteError("OmniRoute rejected the API key (HTTP %d). Create/copy a key in the OmniRoute "
+                                 "dashboard → API Keys, then try again." % e.code)
+        raise OmniRouteError(f"OmniRoute answered with HTTP {e.code}. Is the address correct?")
+    except urllib.error.URLError as e:
+        raise OmniRouteError(f"Can't reach {base_url} ({e.reason}). Is OmniRoute running, and is the address right?")
+    except (TimeoutError, OSError) as e:
+        raise OmniRouteError(f"Connection to {base_url} failed: {e}")
+    except ValueError:
+        raise OmniRouteError(f"{base_url} didn't return JSON — it may not be an OmniRoute server.")
+
+    rows = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise OmniRouteError("Unexpected response from /v1/models.")
+    ids = sorted({r["id"] if isinstance(r, dict) else str(r) for r in rows if (isinstance(r, dict) and r.get("id")) or isinstance(r, str)})
+    if not ids:
+        raise OmniRouteError("OmniRoute returned 0 models. Connect a provider in the OmniRoute dashboard first.")
+    return ids
+
+
+# --------------------------------------------------------------------------- #
+# Model naming / grouping
+# --------------------------------------------------------------------------- #
+
+def provider_of(model_id: str) -> str:
+    return model_id.split("/", 1)[0] if "/" in model_id else "other"
+
+
+def provider_label(provider: str) -> str:
+    return PROVIDER_LABELS.get(provider, provider.replace("-", " ").replace("_", " ").title())
+
+
+def pretty_name(model_id: str) -> str:
+    """'antigravity/claude-sonnet-5-5' -> 'Claude Sonnet 5.5'."""
+    raw = model_id.split("/", 1)[-1]
+    date = re.search(r"-(\d{4})(\d{2})(\d{2})$", raw)
+    date_str = ""
+    if date:
+        date_str = f" ({date.group(1)}-{date.group(2)}-{date.group(3)})"
+        raw = raw[: date.start()]
+    raw = re.sub(r"(?<=\D)-(\d+)-(\d+)(?=-|$)", r"-\1.\2", raw)
+    words = [w if re.fullmatch(r"\d+(\.\d+)?", w) else w.capitalize() for w in raw.split("-")]
+    return " ".join(words) + date_str
+
+
+def tagged_name(model_id: str, tag_style: str) -> str:
+    base, label = pretty_name(model_id), provider_label(provider_of(model_id))
+    return {"prefix": f"[{label}] {base}", "suffix": f"{base} ({label})", "none": base}.get(tag_style, f"[{label}] {base}")
+
+
+def split_effort(model_id: str) -> Tuple[str, Optional[str]]:
+    for eff in EFFORT_ORDER:
+        if model_id.endswith("-" + eff):
+            return model_id[: -len(eff) - 1], eff
+    return model_id, None
+
+
+def build_entries(selected_ids: List[str], catalog: set, tag_style: str = "prefix", group: bool = True) -> List[Dict[str, Any]]:
+    """
+    Turn selected model ids into T3 customModels entries.
+
+    Reasoning-effort variants (-low/-medium/-high/...) are folded into ONE entry with a
+    "Reasoning" dropdown — but only when the un-suffixed base model really exists in the
+    live catalog. Otherwise T3 would send a model name OmniRoute doesn't serve (the
+    "not available in the active live catalog" error), so those variants stay separate.
+    """
+    entries: List[Dict[str, Any]] = []
+    done: set = set()
+    for mid in sorted(selected_ids):
+        if mid in done:
+            continue
+        base, eff = split_effort(mid)
+        if group and base in catalog:
+            efforts = sorted(
+                {split_effort(s)[1] for s in selected_ids if split_effort(s)[0] == base and split_effort(s)[1]},
+                key=EFFORT_ORDER.index,
+            )
+            done.update(s for s in selected_ids if split_effort(s)[0] == base)
+            entry: Dict[str, Any] = {"slug": base, "name": tagged_name(base, tag_style)}
+            if efforts:
+                default = "medium" if "medium" in efforts else efforts[0]
+                entry["capabilities"] = {"optionDescriptors": [{
+                    "id": "effort", "label": "Reasoning", "type": "select",
+                    "options": [dict({"id": e, "label": EFFORT_LABELS[e]}, **({"isDefault": True} if e == default else {})) for e in efforts],
+                }]}
+            entries.append(entry)
+        else:
+            done.add(mid)
+            entries.append({"slug": mid, "name": tagged_name(mid, tag_style)})
     return entries
 
 
-def load_t3_settings() -> Dict[str, Any]:
-    """Load ~/.t3/userdata/settings.json."""
-    if not os.path.exists(SETTINGS_PATH):
-        raise FileNotFoundError(f"T3 settings file not found at: {SETTINGS_PATH}")
-    with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+# --------------------------------------------------------------------------- #
+# T3 / Claude-home files
+# --------------------------------------------------------------------------- #
 
-
-def save_t3_settings(settings: Dict[str, Any], backup: bool = True) -> Optional[str]:
-    """Safely save settings to ~/.t3/userdata/settings.json with timestamped backup."""
-    backup_path = None
-    if backup and os.path.exists(SETTINGS_PATH):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{SETTINGS_PATH}.bak.{timestamp}"
-        shutil.copy2(SETTINGS_PATH, backup_path)
-
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
-
-    return backup_path
-
-
-def show_status():
-    """Print current OmniRoute provider status in T3 Code."""
-    print("=== T3 Code OmniRoute Provider Status ===")
+def read_json(path: str) -> Dict[str, Any]:
     try:
-        settings = load_t3_settings()
-    except Exception as e:
-        print(f"Error loading T3 settings: {e}")
-        return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
 
-    instances = settings.get("providerInstances", {})
-    omniroute = instances.get("omniroute")
-    if not omniroute:
-        print("OmniRoute provider: [NOT CONFIGURED]")
-        return
 
-    enabled = omniroute.get("enabled", False)
-    driver = omniroute.get("driver", "unknown")
-    cfg = omniroute.get("config", {})
-    custom_models = cfg.get("customModels", [])
-    home_path = cfg.get("homePath", "default")
+def write_json_atomic(path: str, data: Dict[str, Any], mode: Optional[int] = None) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        if mode is not None:
+            os.chmod(tmp, mode)
+        else:
+            shutil.copymode(path, tmp) if os.path.exists(path) else None
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
-    env_map = {item.get("name"): item.get("value") for item in omniroute.get("environment", [])}
-    base_url = env_map.get("ANTHROPIC_BASE_URL", "not set")
 
-    print(f"Provider:      Omniroute")
-    print(f"Enabled:       {'YES' if enabled else 'NO'}")
-    print(f"Driver:        {driver}")
-    print(f"Base URL:      {base_url}")
-    print(f"Home Path:     {home_path}")
-    print(f"Custom Models: {len(custom_models)} registered")
-    if custom_models:
-        print("\nRegistered Models:")
-        for item in custom_models[:25]:
-            if isinstance(item, dict):
-                slug = item.get("slug", "unknown")
-                name = item.get("name", slug)
-                opts = item.get("capabilities", {}).get("optionDescriptors", [])
-                effort_opt = next((o for o in opts if o.get("id") == "effort"), None)
-                if effort_opt:
-                    efforts = [c.get("id") for c in effort_opt.get("options", [])]
-                    print(f"  • {name} [{slug}] (Reasoning: {', '.join(efforts)})")
+def backup_file(path: str, keep: int = 10) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    dest = f"{path}.bak.{datetime.datetime.now():%Y%m%d_%H%M%S}"
+    shutil.copy2(path, dest)
+    for old in sorted(glob.glob(path + ".bak.*"))[:-keep]:
+        try:
+            os.unlink(old)
+        except OSError:
+            pass
+    return dest
+
+
+def saved_connection(home_path: str) -> Tuple[str, str]:
+    """(base_url, api_key) from a previous run, else best-effort defaults."""
+    url = key = ""
+    inst = read_json(T3_SETTINGS_PATH).get("providerInstances", {}).get(INSTANCE_ID, {})
+    for env in inst.get("environment", []):
+        if env.get("name") == "ANTHROPIC_BASE_URL":
+            url = env.get("value", "")
+    key = read_json(os.path.join(os.path.expanduser(home_path), "settings.json")).get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+    if not url:
+        cli = read_json(OMNIROUTE_CLI_CONFIG)
+        url = cli.get("contexts", {}).get(cli.get("currentContext", ""), {}).get("baseUrl", "")
+    key = key or os.environ.get("OMNIROUTE_API_KEY", "")
+    return os.environ.get("OMNIROUTE_BASE_URL", url), key
+
+
+def write_claude_home(home_path: str, base_url: str, api_key: str) -> str:
+    """Create the Claude config dir and point its settings.json at OmniRoute."""
+    home = os.path.expanduser(home_path)
+    os.makedirs(home, exist_ok=True)
+    path = os.path.join(home, "settings.json")
+    settings = read_json(path)
+    env = settings.setdefault("env", {})
+    env["ANTHROPIC_BASE_URL"] = base_url
+    env["ANTHROPIC_AUTH_TOKEN"] = api_key
+    env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+    if os.path.exists(path):
+        backup_file(path, keep=3)
+    write_json_atomic(path, settings, mode=0o600)  # holds the API key
+    return path
+
+
+def build_instance(existing: Dict[str, Any], base_url: str, home_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Update (or create) the T3 provider instance, preserving unrelated user settings."""
+    wanted = {"ANTHROPIC_BASE_URL": base_url, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}
+    env = [dict(e) for e in existing.get("environment", [])]
+    for name, value in wanted.items():
+        for e in env:
+            if e.get("name") == name:
+                e["value"] = value
+                break
+        else:
+            env.append({"name": name, "value": value, "sensitive": False})
+    config = dict(existing.get("config", {}))
+    config.update({"homePath": home_path, "customModels": entries})
+    config.setdefault("autoCompactWindow", "300000")
+    inst = dict(existing)
+    inst.update({"driver": "claudeAgent", "displayName": existing.get("displayName", DISPLAY_NAME),
+                 "environment": env, "enabled": True, "config": config})
+    return inst
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def cmd_status() -> int:
+    inst = read_json(T3_SETTINGS_PATH).get("providerInstances", {}).get(INSTANCE_ID)
+    if not inst:
+        print("Omniroute provider: not set up yet. Run: python3 sync.py")
+        return 0
+    env = {e.get("name"): e.get("value") for e in inst.get("environment", [])}
+    cfg = inst.get("config", {})
+    models = cfg.get("customModels", [])
+    print(f"Omniroute provider: {'enabled' if inst.get('enabled') else 'DISABLED'}")
+    print(f"  Address:  {env.get('ANTHROPIC_BASE_URL', '(not set)')}")
+    print(f"  Folder:   {cfg.get('homePath', '(default)')}")
+    print(f"  Models:   {len(models)}")
+    for m in models:
+        slug = m.get("slug") if isinstance(m, dict) else m
+        name = m.get("name", slug) if isinstance(m, dict) else m
+        print(f"    • {name}  [{slug}]")
+    return 0
+
+
+def pick_connection(args: argparse.Namespace) -> Tuple[str, str, List[str]]:
+    """Ask for address + key until OmniRoute accepts them. Returns (url, key, model_ids)."""
+    saved_url, saved_key = saved_connection(args.home_path)
+    url_default = args.url or saved_url or f"http://localhost:{DEFAULT_PORT}"
+    key_default = args.key or saved_key
+    interactive = not args.yes
+    while True:
+        try:
+            if interactive:
+                print(dim("  Example: 192.168.1.20:20128   or   http://localhost:20128"))
+                typed = ask("OmniRoute address", url_default)
+                url_default = typed  # remembered if we have to ask again
+                url = normalize_url(typed)
+                if key_default:
+                    print(dim(f"  Press Enter to reuse the saved key ({mask(key_default)})."))
                 else:
-                    print(f"  • {name} [{slug}]")
+                    print(dim("  Your typing is hidden — paste the key and press Enter."))
+                key = ask_secret("API key") or key_default
+                if not key:
+                    raise OmniRouteError("An API key is required.")
             else:
-                print(f"  • {item}")
-        if len(custom_models) > 25:
-            print(f"  ... and {len(custom_models) - 25} more.")
+                url, key = normalize_url(url_default), key_default
+                if not key:
+                    raise OmniRouteError("--yes needs a key: pass --key or set OMNIROUTE_API_KEY.")
+            print(f"  Connecting to {url} …")
+            ids = fetch_models(url, key)
+            print(green(f"  ✓ Connected — {len(ids)} models available."))
+            return url, key, ids
+        except OmniRouteError as e:
+            print(red(f"  ✗ {e}"))
+            if not interactive:
+                raise
+            if not confirm("Try again?", True):
+                raise UserAbort()
 
 
-def list_available_models(filter_pattern: Optional[str] = None, group_thinking: bool = True, source_tag: str = "prefix"):
-    """List models discovered from OmniRoute Claude profiles."""
-    raw_models = discover_models_from_profiles(filter_pattern)
-    if group_thinking:
-        grouped = group_models_by_thinking(raw_models, source_tag=source_tag)
-        print(f"=== Discovered {len(grouped)} Grouped OmniRoute Model(s) (from {len(raw_models)} raw profiles) ===")
-        for item in grouped:
-            slug = item["slug"]
-            name = item["name"]
-            opts = item.get("capabilities", {}).get("optionDescriptors", [])
-            effort_opt = next((o for o in opts if o.get("id") == "effort"), None)
-            if effort_opt:
-                efforts = [c.get("id") for c in effort_opt.get("options", [])]
-                print(f"  • {name} [{slug}] (Reasoning: {', '.join(efforts)})")
-            else:
-                print(f"  • {name} [{slug}]")
+def pick_models(ids: List[str], args: argparse.Namespace) -> List[str]:
+    by_provider: Dict[str, List[str]] = {}
+    for mid in ids:
+        by_provider.setdefault(provider_of(mid), []).append(mid)
+
+    is_claude = lambda m: "claude" in m.lower()
+    pattern = re.compile(args.models, re.I) if args.models else None
+    wanted_providers = {p.strip() for p in args.providers.split(",")} if args.providers else None
+
+    # --- providers ---
+    if wanted_providers is not None:
+        chosen_providers = {p for p in by_provider if p in wanted_providers}
+    elif args.yes or len(by_provider) == 1:
+        chosen_providers = {p for p, ms in by_provider.items() if any(is_claude(m) for m in ms)} or set(by_provider)
     else:
-        print(f"=== Discovered {len(raw_models)} Raw OmniRoute Model(s) ===")
-        for m in raw_models:
-            print(f"  • {m}")
+        step(3, 5, "Choose providers")
+        items = [(p, provider_label(p), f"{len(ms)} model{'s' * (len(ms) != 1)}" + (f", {sum(map(is_claude, ms))} Claude" if any(map(is_claude, ms)) else ""))
+                 for p, ms in sorted(by_provider.items())]
+        pre = {p for p, ms in by_provider.items() if any(is_claude(m) for m in ms)}
+        chosen_providers = checklist("Which providers do you want in T3 Code?",
+                                     "Providers that serve Claude models are pre-selected.", items, pre)
+    candidates = [m for m in ids if provider_of(m) in chosen_providers]
+    if not candidates:
+        raise OmniRouteError("No models selected.")
+
+    # --- models ---
+    if args.yes or args.models or args.all:
+        picked = [m for m in candidates if args.all or (pattern.search(m) if pattern else is_claude(m))]
+        return picked
+    step(4, 5, "Choose models")
+    items: List[Item] = []
+    for m in candidates:
+        base, eff = split_effort(m)
+        if base in ids and eff:
+            continue  # folded into the base model's Reasoning dropdown
+        variants = [split_effort(x)[1] for x in candidates if split_effort(x)[0] == m and split_effort(x)[1]]
+        detail = ("Reasoning: " + "/".join(sorted(variants, key=EFFORT_ORDER.index))) if variants else ""
+        items.append((m, f"{provider_label(provider_of(m))} · {pretty_name(m)}", detail))
+    pre = {k for k, _, _ in items if is_claude(k)}
+    keys = checklist("Which models do you want in T3 Code?",
+                     "Claude models are pre-selected. Reasoning levels are folded into one model.", items, pre)
+    picked = [m for m in candidates if (split_effort(m)[0] if split_effort(m)[0] in ids and split_effort(m)[1] else m) in keys]
+    return picked
 
 
-def build_provider_config(base_url: str, home_path: str, custom_models: List[Any]) -> Dict[str, Any]:
-    """Construct providerInstance JSON structure for OmniRoute."""
-    return {
-        "driver": "claudeAgent",
-        "displayName": "Omniroute",
-        "environment": [
-            {
-                "name": "ANTHROPIC_BASE_URL",
-                "value": base_url,
-                "sensitive": False
-            },
-            {
-                "name": "ANTHROPIC_AUTH_TOKEN",
-                "value": "",
-                "sensitive": True,
-                "valueRedacted": True
-            },
-            {
-                "name": "ANTHROPIC_API_KEY",
-                "value": "",
-                "sensitive": False
-            },
-            {
-                "name": "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
-                "value": "1",
-                "sensitive": False
-            }
-        ],
-        "enabled": True,
-        "config": {
-            "homePath": home_path,
-            "autoCompactWindow": "300000",
-            "customModels": custom_models
-        }
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Sync OmniRoute models into T3 Code settings with thinking level grouping and source tagging."
-    )
-    parser.add_argument("--status", action="store_true", help="Show current OmniRoute provider status in T3 Code")
-    parser.add_argument("--list", action="store_true", help="List discovered OmniRoute models without modifying anything")
-    parser.add_argument("--base-url", default=None, help=f"OmniRoute endpoint (default: auto-detected or {DEFAULT_BASE_URL})")
-    parser.add_argument("--home-path", default=DEFAULT_HOME_PATH, help=f"Custom Claude home directory (default: {DEFAULT_HOME_PATH})")
-    parser.add_argument("--filter", default=None, help="Regex pattern to filter models (e.g. 'claude/|antigravity/.*claude')")
-    parser.add_argument("--source-tag", choices=["prefix", "suffix", "bullet", "short", "none"], default="prefix",
-                        help="How to distinguish upstream sources (e.g. [Anthropic] vs [Antigravity]). Default: prefix")
-    parser.add_argument("--all", action="store_true", help="Load ALL available models (500+ models)")
-    parser.add_argument("--replace", action="store_true", help="Replace customModels entirely instead of merging")
-    parser.add_argument("--no-group-thinking", action="store_true", help="Do not group thinking levels; list each variant as separate model")
-    parser.add_argument("--dry-run", action="store_true", help="Preview configuration changes without writing to disk")
-
-    args = parser.parse_args()
-    group_thinking = not args.no_group_thinking
-
-    if args.status:
-        show_status()
-        return 0
-
-    if args.list:
-        list_available_models(args.filter, group_thinking=group_thinking, source_tag=args.source_tag)
-        return 0
-
-    base_url = args.base_url or get_omniroute_base_url()
-    print(f"[*] OmniRoute Base URL: {base_url}")
-    print(f"[*] Source tag style: {args.source_tag}")
-
-    # Determine filter pattern
-    pattern = args.filter
-    if not args.all and not args.filter:
-        print("[*] No filter specified. Defaulting to 'claude/|antigravity/.*claude'.")
-        pattern = r"claude/|antigravity/.*claude"
-
-    discovered_slugs = discover_models_from_profiles(pattern)
-    print(f"[*] Discovered {len(discovered_slugs)} raw model profile(s) matching filter.")
-    if not discovered_slugs:
-        print("[-] No models found! Run 'omniroute setup-claude' first or check filter.", file=sys.stderr)
+def cmd_setup(args: argparse.Namespace) -> int:
+    print(bold("\n  OmniRoute → T3 Code setup"))
+    print(dim("  This connects T3 Code to your OmniRoute so you can pick its models in the model menu.\n"))
+    if not os.path.exists(T3_SETTINGS_PATH):
+        print(red(f"  Couldn't find T3 Code's settings at {T3_SETTINGS_PATH}."))
+        print("  Open T3 Code at least once, then run this again.")
         return 1
 
-    if group_thinking:
-        models_to_register = group_models_by_thinking(discovered_slugs, source_tag=args.source_tag)
-        print(f"[*] Grouped into {len(models_to_register)} base model(s) with interactive Reasoning selectors.")
-    else:
-        models_to_register = discovered_slugs
-        print(f"[*] Registering {len(models_to_register)} flat model slug(s).")
+    step(1, 5, "Where is your OmniRoute?")
+    url, key, ids = pick_connection(args)
+    catalog = set(ids)
 
-    try:
-        settings = load_t3_settings()
-    except Exception as e:
-        print(f"[-] Failed to load T3 settings: {e}", file=sys.stderr)
+    if args.yes:
+        step(2, 5, "Choosing models automatically")
+    else:
+        step(2, 5, "Where should the Claude config folder live?")
+        args.home_path = ask("Folder", args.home_path)
+    picked = pick_models(ids, args)
+    if not picked:
+        print(red("  No models selected — nothing to do."))
         return 1
+    entries = build_entries(picked, catalog, args.source_tag, group=not args.no_group)
 
-    provider_instances = settings.setdefault("providerInstances", {})
-    existing_instance = provider_instances.get("omniroute", {})
-    existing_models = existing_instance.get("config", {}).get("customModels", [])
-
-    if args.replace:
-        final_models = models_to_register
-    else:
-        # Merge preserving order by slug
-        seen_slugs = set()
-        final_models = []
-        for item in existing_models:
-            slug = item.get("slug") if isinstance(item, dict) else item
-            if slug and slug not in seen_slugs:
-                seen_slugs.add(slug)
-                final_models.append(item)
-        for item in models_to_register:
-            slug = item.get("slug") if isinstance(item, dict) else item
-            if slug and slug not in seen_slugs:
-                seen_slugs.add(slug)
-                final_models.append(item)
-
-    new_config = build_provider_config(base_url, args.home_path, final_models)
+    step(5, 5, "Review and apply")
+    print(f"  Address : {url}")
+    print(f"  API key : {mask(key)}")
+    print(f"  Folder  : {args.home_path}")
+    print(f"  Models  : {len(entries)} entries ({len(picked)} variants)")
+    for e in entries[:12]:
+        efforts = [o["id"] for d in e.get("capabilities", {}).get("optionDescriptors", []) for o in d.get("options", [])]
+        print(f"    • {e['name']}" + (dim(f"  (Reasoning: {'/'.join(efforts)})") if efforts else ""))
+    if len(entries) > 12:
+        print(dim(f"    … and {len(entries) - 12} more"))
 
     if args.dry_run:
-        print("\n--- [DRY RUN] Generated Configuration ---")
-        print(json.dumps(new_config, indent=2)[:1500])
-        print(f"\nTotal models to be registered: {len(final_models)}")
-        print("Sample models:")
-        for m in final_models[:20]:
-            if isinstance(m, dict):
-                print(f"  • {m.get('name')} [{m.get('slug')}]")
-            else:
-                print(f"  • {m}")
-        if len(final_models) > 20:
-            print(f"  ... and {len(final_models) - 20} more.")
+        print(yellow("\n  Dry run — nothing was written."))
         return 0
+    if not args.yes and not confirm("\n  Apply these settings?", True):
+        raise UserAbort()
 
-    provider_instances["omniroute"] = new_config
+    settings = read_json(T3_SETTINGS_PATH)
+    instances = settings.setdefault("providerInstances", {})
+    existing = instances.get(INSTANCE_ID, {})
+    home_file = write_claude_home(args.home_path, url, key)
+    backup = backup_file(T3_SETTINGS_PATH)
+    instances[INSTANCE_ID] = build_instance(existing, url, args.home_path, entries)
+    write_json_atomic(T3_SETTINGS_PATH, settings)
 
-    try:
-        backup_file = save_t3_settings(settings, backup=True)
-        if backup_file:
-            print(f"[+] Backup created: {backup_file}")
-        print(f"[+] Updated {SETTINGS_PATH}")
-        print(f"[+] OmniRoute provider successfully configured with {len(final_models)} model(s).")
-        print("[*] Open or re-open the model picker in T3 Code to view your models!")
-    except Exception as e:
-        print(f"[-] Failed to save T3 settings: {e}", file=sys.stderr)
-        return 1
-
+    print(green("\n  ✓ All done!"))
+    print(f"  • Claude folder ready : {os.path.expanduser(args.home_path)}")
+    print(f"  • Credentials saved   : {home_file} (private, mode 600)")
+    print(f"  • T3 provider         : '{DISPLAY_NAME}' with {len(entries)} models" + (" (updated)" if existing else " (created)"))
+    if backup:
+        print(dim(f"  • Backup of old T3 settings: {backup}"))
+    print(bold("\n  Next: open T3 Code's model menu and pick an Omniroute model.") + dim(" (Restart T3 Code if it doesn't show up.)"))
+    print(dim("  Re-run this script any time to add/remove models — your address and key are remembered.\n"))
     return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Set up OmniRoute as a provider in T3 Code. Run with no options for the guided wizard.")
+    p.add_argument("--url", help="OmniRoute address (skips the question's default)")
+    p.add_argument("--key", help="OmniRoute API key (or set OMNIROUTE_API_KEY)")
+    p.add_argument("--home-path", default=DEFAULT_HOME_PATH, help=f"Claude config folder (default {DEFAULT_HOME_PATH})")
+    p.add_argument("--providers", help="Comma-separated provider ids to include, e.g. antigravity,claude")
+    p.add_argument("--models", help="Regex of model ids to include (default: Claude models)")
+    p.add_argument("--all", action="store_true", help="Include every model of the chosen providers")
+    p.add_argument("--source-tag", choices=["prefix", "suffix", "none"], default="prefix", help="How to label the provider in model names")
+    p.add_argument("--no-group", action="store_true", help="Don't fold reasoning levels into one model")
+    p.add_argument("-y", "--yes", action="store_true", help="No questions: use flags/defaults")
+    p.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
+    p.add_argument("--status", action="store_true", help="Show the current T3 Omniroute setup and exit")
+    args = p.parse_args(argv)
+    if os.environ.get("OMNIROUTE_API_KEY") and not args.key:
+        args.key = os.environ["OMNIROUTE_API_KEY"]
+
+    if args.status:
+        return cmd_status()
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        return cmd_setup(args)
+    except (UserAbort, KeyboardInterrupt):
+        print(yellow("\n  Cancelled — nothing was changed."))
+        return 130
+    except OmniRouteError as e:
+        print(red(f"\n  ✗ {e}"))
+        return 1
 
 
 if __name__ == "__main__":
