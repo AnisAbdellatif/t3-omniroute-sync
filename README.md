@@ -44,6 +44,7 @@ Checklist keys: `↑`/`↓` move, `space` ticks, `a` all, `n` none, `/` search, 
 |---|---|
 | `~/.t3/userdata/settings.json` | Adds or updates an `omniroute` provider instance (backup: `settings.json.bak.<time>`, last 10 kept). Other settings are preserved. |
 | `<folder>/settings.json` | Holds `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. The file is mode `600` and the folder mode `700`. |
+| `<folder>/{skills,commands,agents,CLAUDE.md}` | Automatically symlinked from `~/.claude` so all your custom skills, slash commands, agents, and instructions remain available. |
 
 ## Name styles
 
@@ -75,6 +76,7 @@ OmniRoute lists reasoning variants as separate models (`-low`, `-medium`, `-high
 | `--models REGEX` | Only model ids matching this regex (default: Claude models) |
 | `--all` | Every model of the chosen providers |
 | `--home-path DIR` | Claude config folder (default `~/claude_omniroute`) |
+| `--no-link` | Don't symlink skills, commands, and agents from `~/.claude` |
 | `--source-tag STYLE` | `prefix`, `short-prefix`, `suffix`, `short-suffix` or `none` |
 | `--no-group` | Don't fold reasoning levels into one model |
 | `--version` | Print the version |

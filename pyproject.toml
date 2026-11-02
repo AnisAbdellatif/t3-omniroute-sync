@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "t3-omniroute-sync"
-version = "0.3.0"
+version = "0.3.1"
 description = "Sync OmniRoute models into T3 Code as a custom Claude provider"
 readme = "README.md"
 requires-python = ">=3.8"

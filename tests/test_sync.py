@@ -46,5 +46,24 @@ class Grouping(unittest.TestCase):
         self.assertEqual(len(e), 2)
 
 
+class AssetLinking(unittest.TestCase):
+    def test_link_assets(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            os.makedirs(os.path.join(src, "skills"))
+            os.makedirs(os.path.join(src, "commands"))
+            with open(os.path.join(src, "CLAUDE.md"), "w") as f:
+                f.write("test")
+
+            linked = sync.link_shared_assets(dst, source_path=src)
+            self.assertEqual(sorted(linked), ["CLAUDE.md", "commands", "skills"])
+            self.assertTrue(os.path.islink(os.path.join(dst, "skills")))
+            self.assertTrue(os.path.islink(os.path.join(dst, "CLAUDE.md")))
+
+            # Re-running does not re-link or fail
+            linked2 = sync.link_shared_assets(dst, source_path=src)
+            self.assertEqual(linked2, [])
+
+
 if __name__ == "__main__":
     unittest.main()

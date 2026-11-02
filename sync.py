@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover
 T3_SETTINGS_PATH = os.path.expanduser("~/.t3/userdata/settings.json")
 OMNIROUTE_CLI_CONFIG = os.path.expanduser("~/.omniroute/config.json")
 DEFAULT_HOME_PATH = "~/claude_omniroute"
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 DEFAULT_PORT = 20128
 INSTANCE_ID = "omniroute"
 DISPLAY_NAME = "Omniroute"
@@ -455,6 +455,28 @@ def write_claude_home(home_path: str, base_url: str, api_key: str) -> str:
     return path
 
 
+SHAREABLE_ASSETS = ["skills", "commands", "agents", "CLAUDE.md"]
+
+
+def link_shared_assets(home_path: str, source_path: str = "~/.claude") -> List[str]:
+    """Symlink shared skills, commands, agents, and CLAUDE.md from ~/.claude."""
+    home = os.path.expanduser(home_path)
+    source = os.path.expanduser(source_path)
+    if os.path.abspath(home) == os.path.abspath(source):
+        return []
+    linked: List[str] = []
+    for item in SHAREABLE_ASSETS:
+        src = os.path.join(source, item)
+        dst = os.path.join(home, item)
+        if os.path.exists(src) and not os.path.lexists(dst):
+            try:
+                os.symlink(src, dst)
+                linked.append(item)
+            except OSError:
+                pass
+    return linked
+
+
 def build_instance(existing: Dict[str, Any], base_url: str, home_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Update (or create) the T3 provider instance, preserving unrelated user settings."""
     wanted = {"ANTHROPIC_BASE_URL": base_url, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}
@@ -621,7 +643,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     step(5, 5, "Review and apply")
     print(f"  Address : {url}")
     print(f"  API key : {mask(key)}")
-    print(f"  Folder  : {args.home_path}")
+    print(f"  Folder  : {args.home_path}" + (" (shares skills/commands from ~/.claude)" if not args.no_link else ""))
     print(f"  Models  : {len(entries)} entries ({len(picked)} variants)")
     for e in entries[:12]:
         efforts = [o["id"] for d in e.get("capabilities", {}).get("optionDescriptors", []) for o in d.get("options", [])]
@@ -639,6 +661,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     instances = settings.setdefault("providerInstances", {})
     existing = instances.get(INSTANCE_ID, {})
     home_file = write_claude_home(args.home_path, url, key)
+    linked = [] if args.no_link else link_shared_assets(args.home_path)
     backup = backup_file(T3_SETTINGS_PATH)
     instances[INSTANCE_ID] = build_instance(existing, url, args.home_path, entries)
     write_json_atomic(T3_SETTINGS_PATH, settings)
@@ -646,6 +669,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print(green("\n  ✓ All done!"))
     print(f"  • Claude folder ready : {os.path.expanduser(args.home_path)}")
     print(f"  • Credentials saved   : {home_file} (private, mode 600)")
+    if linked:
+        print(f"  • Shared assets linked: {', '.join(linked)} (from ~/.claude)")
     print(f"  • T3 provider         : '{DISPLAY_NAME}' with {len(entries)} models" + (" (updated)" if existing else " (created)"))
     if backup:
         print(dim(f"  • Backup of old T3 settings: {backup}"))
@@ -664,6 +689,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--all", action="store_true", help="Include every model of the chosen providers")
     p.add_argument("--source-tag", choices=TAG_STYLES, default=None, help="How to label the provider in model names (default: prefix; the wizard asks)")
     p.add_argument("--no-group", action="store_true", help="Don't fold reasoning levels into one model")
+    p.add_argument("--no-link", action="store_true", help="Don't symlink skills, commands, and agents from ~/.claude")
     p.add_argument("-y", "--yes", action="store_true", help="No questions: use flags/defaults")
     p.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
