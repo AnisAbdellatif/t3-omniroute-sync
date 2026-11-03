@@ -64,6 +64,30 @@ class AssetLinking(unittest.TestCase):
             linked2 = sync.link_shared_assets(dst, source_path=src)
             self.assertEqual(linked2, [])
 
+    def test_replaces_real_dir_and_keeps_symlinks(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            os.makedirs(os.path.join(src, "plugins"))
+            os.makedirs(os.path.join(src, "agents"))
+            os.makedirs(os.path.join(dst, "plugins"))  # created by Claude in the folder
+            os.symlink(src, os.path.join(dst, "agents"))  # user's own link: untouched
+            linked = sync.link_shared_assets(dst, source_path=src)
+            self.assertEqual(linked, ["plugins"])
+            self.assertEqual(os.path.realpath(os.path.join(dst, "plugins")), os.path.realpath(os.path.join(src, "plugins")))
+            self.assertEqual(len([n for n in os.listdir(dst) if n.startswith("plugins.bak.")]), 1)
+            self.assertEqual(os.readlink(os.path.join(dst, "agents")), src)
+
+    def test_share_settings_keeps_local_keys(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+            sync.write_json_atomic(os.path.join(src, "settings.json"),
+                                   {"env": {"A": "src"}, "model": "m1", "enabledPlugins": {"p@m": True}, "theme": "dark"})
+            sync.write_json_atomic(os.path.join(dst, "settings.json"), {"env": {"A": "dst"}, "theme": "light"})
+            self.assertEqual(sorted(sync.share_settings(dst, source_path=src)), ["enabledPlugins", "theme"])
+            got = sync.read_json(os.path.join(dst, "settings.json"))
+            self.assertEqual(got, {"env": {"A": "dst"}, "theme": "dark", "enabledPlugins": {"p@m": True}})
+            self.assertEqual(sync.share_settings(dst, source_path=src), [])
+
     def test_promote_synced_skills(self):
         import tempfile
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:

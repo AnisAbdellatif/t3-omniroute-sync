@@ -455,11 +455,17 @@ def write_claude_home(home_path: str, base_url: str, api_key: str) -> str:
     return path
 
 
-SHAREABLE_ASSETS = ["skills", "commands", "agents", "CLAUDE.md"]
+SHAREABLE_ASSETS = ["skills", "commands", "agents", "plugins", "hooks", "output-styles", "CLAUDE.md", "keybindings.json"]
+# settings.json keys that stay per-folder (connection/model are OmniRoute-specific)
+LOCAL_SETTINGS_KEYS = {"env", "model", "apiKeyHelper"}
 
 
 def link_shared_assets(home_path: str, source_path: str = "~/.claude") -> List[str]:
-    """Symlink shared skills, commands, agents, and CLAUDE.md from ~/.claude."""
+    """Symlink skills, commands, agents, plugins, hooks, etc. from ~/.claude.
+
+    A real file/folder already in the way (e.g. a plugins/ dir Claude created) is
+    moved aside to `<name>.bak.<timestamp>`; existing symlinks are left alone.
+    """
     home = os.path.expanduser(home_path)
     source = os.path.expanduser(source_path)
     if os.path.abspath(home) == os.path.abspath(source):
@@ -477,16 +483,39 @@ def link_shared_assets(home_path: str, source_path: str = "~/.claude") -> List[s
                 pass
 
     linked: List[str] = []
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     for item in SHAREABLE_ASSETS:
         src = os.path.join(source, item)
         dst = os.path.join(home, item)
-        if os.path.exists(src) and not os.path.lexists(dst):
-            try:
-                os.symlink(src, dst)
-                linked.append(item)
-            except OSError:
-                pass
+        if not os.path.exists(src) or os.path.islink(dst):
+            continue
+        try:
+            if os.path.lexists(dst):
+                os.rename(dst, f"{dst}.bak.{stamp}")
+            os.symlink(src, dst)
+            linked.append(item)
+        except OSError:
+            pass
     return linked
+
+
+def share_settings(home_path: str, source_path: str = "~/.claude") -> List[str]:
+    """Copy ~/.claude/settings.json keys (plugins, marketplaces, hooks, ...) into the
+    folder's settings.json, keeping its own env/model. Returns the keys that changed."""
+    home = os.path.expanduser(home_path)
+    source = os.path.expanduser(source_path)
+    if os.path.abspath(home) == os.path.abspath(source):
+        return []
+    src = read_json(os.path.join(source, "settings.json"))
+    path = os.path.join(home, "settings.json")
+    settings = read_json(path)
+    changed = [k for k, v in src.items() if k not in LOCAL_SETTINGS_KEYS and settings.get(k) != v]
+    if changed:
+        settings.update({k: src[k] for k in changed})
+        if os.path.exists(path):
+            backup_file(path, keep=3)
+        write_json_atomic(path, settings, mode=0o600)  # holds the API key
+    return changed
 
 
 def build_instance(existing: Dict[str, Any], base_url: str, home_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -512,6 +541,17 @@ def build_instance(existing: Dict[str, Any], base_url: str, home_path: str, entr
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
+
+def cmd_link(home_path: str) -> int:
+    if not os.path.isdir(os.path.expanduser(home_path)):
+        print(red(f"  {home_path} doesn't exist yet — run the setup first."))
+        return 1
+    linked, shared = link_shared_assets(home_path), share_settings(home_path)
+    print(green("  ✓ ") + (f"Linked: {', '.join(linked)}" if linked else "Links already up to date"))
+    print(green("  ✓ ") + (f"Settings shared: {', '.join(shared)}" if shared else "Settings already up to date"))
+    print(dim("  Restart Claude/T3 sessions using this folder to pick up the changes."))
+    return 0
+
 
 def cmd_status() -> int:
     inst = read_json(T3_SETTINGS_PATH).get("providerInstances", {}).get(INSTANCE_ID)
@@ -655,7 +695,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     step(5, 5, "Review and apply")
     print(f"  Address : {url}")
     print(f"  API key : {mask(key)}")
-    print(f"  Folder  : {args.home_path}" + (" (shares skills/commands from ~/.claude)" if not args.no_link else ""))
+    print(f"  Folder  : {args.home_path}" + (" (shares skills, plugins, agents, settings from ~/.claude)" if not args.no_link else ""))
     print(f"  Models  : {len(entries)} entries ({len(picked)} variants)")
     for e in entries[:12]:
         efforts = [o["id"] for d in e.get("capabilities", {}).get("optionDescriptors", []) for o in d.get("options", [])]
@@ -674,6 +714,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     existing = instances.get(INSTANCE_ID, {})
     home_file = write_claude_home(args.home_path, url, key)
     linked = [] if args.no_link else link_shared_assets(args.home_path)
+    shared = [] if args.no_link else share_settings(args.home_path)
     backup = backup_file(T3_SETTINGS_PATH)
     instances[INSTANCE_ID] = build_instance(existing, url, args.home_path, entries)
     write_json_atomic(T3_SETTINGS_PATH, settings)
@@ -683,6 +724,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print(f"  • Credentials saved   : {home_file} (private, mode 600)")
     if linked:
         print(f"  • Shared assets linked: {', '.join(linked)} (from ~/.claude)")
+    if shared:
+        print(f"  • Settings shared     : {', '.join(shared)} (from ~/.claude/settings.json)")
     print(f"  • T3 provider         : '{DISPLAY_NAME}' with {len(entries)} models" + (" (updated)" if existing else " (created)"))
     if backup:
         print(dim(f"  • Backup of old T3 settings: {backup}"))
@@ -701,7 +744,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--all", action="store_true", help="Include every model of the chosen providers")
     p.add_argument("--source-tag", choices=TAG_STYLES, default=None, help="How to label the provider in model names (default: prefix; the wizard asks)")
     p.add_argument("--no-group", action="store_true", help="Don't fold reasoning levels into one model")
-    p.add_argument("--no-link", action="store_true", help="Don't symlink skills, commands, and agents from ~/.claude")
+    p.add_argument("--no-link", action="store_true", help="Don't share skills, plugins, agents, etc. or settings from ~/.claude")
+    p.add_argument("--link-only", action="store_true", help="Only (re)share skills, plugins, agents, etc. and settings from ~/.claude, then exit")
     p.add_argument("-y", "--yes", action="store_true", help="No questions: use flags/defaults")
     p.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -712,6 +756,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     os.environ.setdefault("ESCDELAY", "25")
     try:
+        if args.link_only:
+            return cmd_link(args.home_path)
         return cmd_status() if args.status else cmd_setup(args)
     except (UserAbort, KeyboardInterrupt):
         print(yellow("\n  Cancelled — nothing was changed."))
