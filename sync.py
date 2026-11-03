@@ -455,20 +455,42 @@ def write_claude_home(home_path: str, base_url: str, api_key: str) -> str:
     return path
 
 
-SHAREABLE_ASSETS = ["skills", "commands", "agents", "plugins", "hooks", "output-styles", "CLAUDE.md", "keybindings.json"]
+# Everything in ~/.claude is shared (symlinked) except per-folder state: the OmniRoute
+# connection (settings.json, merged via share_settings), account files, and runtime caches.
+LOCAL_ITEMS = {"settings.json", ".claude.json", ".credentials.json", ".last-cleanup", "backups", "cache",
+               "sessions", "session-env", "shell-snapshots", "telemetry", "statsig"}
+LOCAL_PREFIXES = ("settings.", ".claude.json", "policy-limits", "remote-settings")  # settings.* incl. private/build files
 # settings.json keys that stay per-folder (connection/model are OmniRoute-specific)
 LOCAL_SETTINGS_KEYS = {"env", "model", "apiKeyHelper"}
 
 
-def link_shared_assets(home_path: str, source_path: str = "~/.claude") -> List[str]:
-    """Symlink skills, commands, agents, plugins, hooks, etc. from ~/.claude.
+def is_local_item(name: str) -> bool:
+    return name in LOCAL_ITEMS or name.startswith(LOCAL_PREFIXES) or ".bak" in name
 
-    A real file/folder already in the way (e.g. a plugins/ dir Claude created) is
-    moved aside to `<name>.bak.<timestamp>`; existing symlinks are left alone.
+
+def _merge_into(src_dir: str, dst_dir: str) -> None:
+    """Move src_dir's entries into dst_dir (recursing into shared dirs; never overwriting),
+    then remove src_dir if it ended up empty."""
+    for name in os.listdir(src_dir):
+        a, b = os.path.join(src_dir, name), os.path.join(dst_dir, name)
+        if not os.path.lexists(b):
+            os.rename(a, b)
+        elif os.path.isdir(a) and not os.path.islink(a) and os.path.isdir(b) and not os.path.islink(b):
+            _merge_into(a, b)
+    if not os.listdir(src_dir):
+        os.rmdir(src_dir)
+
+
+def link_shared_assets(home_path: str, source_path: str = "~/.claude") -> List[str]:
+    """Make every shareable item in the folder a symlink to ~/.claude.
+
+    Items only in the folder are moved into ~/.claude first; a real folder in the way is
+    merged into ~/.claude (conflicting leftovers go to `<name>.bak.<timestamp>`); a real
+    file in the way is moved to `<name>.bak.<timestamp>`. Existing symlinks are left alone.
     """
     home = os.path.expanduser(home_path)
     source = os.path.expanduser(source_path)
-    if os.path.abspath(home) == os.path.abspath(source):
+    if os.path.abspath(home) == os.path.abspath(source) or not os.path.isdir(source):
         return []
 
     # Expose account-synced skills (e.g. ~/.claude/skills/synced/*/*) as top-level skills
@@ -484,12 +506,17 @@ def link_shared_assets(home_path: str, source_path: str = "~/.claude") -> List[s
 
     linked: List[str] = []
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    for item in SHAREABLE_ASSETS:
+    names = set(os.listdir(source)) | (set(os.listdir(home)) if os.path.isdir(home) else set())
+    for item in sorted(n for n in names if not is_local_item(n)):
         src = os.path.join(source, item)
         dst = os.path.join(home, item)
-        if not os.path.exists(src) or os.path.islink(dst):
+        if os.path.islink(dst):
             continue
         try:
+            if not os.path.lexists(src):
+                os.rename(dst, src)  # only in the folder: move it into ~/.claude
+            elif os.path.isdir(dst) and os.path.isdir(src):
+                _merge_into(dst, src)
             if os.path.lexists(dst):
                 os.rename(dst, f"{dst}.bak.{stamp}")
             os.symlink(src, dst)
@@ -695,7 +722,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     step(5, 5, "Review and apply")
     print(f"  Address : {url}")
     print(f"  API key : {mask(key)}")
-    print(f"  Folder  : {args.home_path}" + (" (shares skills, plugins, agents, settings from ~/.claude)" if not args.no_link else ""))
+    print(f"  Folder  : {args.home_path}" + (" (linked to ~/.claude except its OmniRoute connection)" if not args.no_link else ""))
     print(f"  Models  : {len(entries)} entries ({len(picked)} variants)")
     for e in entries[:12]:
         efforts = [o["id"] for d in e.get("capabilities", {}).get("optionDescriptors", []) for o in d.get("options", [])]
@@ -744,8 +771,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--all", action="store_true", help="Include every model of the chosen providers")
     p.add_argument("--source-tag", choices=TAG_STYLES, default=None, help="How to label the provider in model names (default: prefix; the wizard asks)")
     p.add_argument("--no-group", action="store_true", help="Don't fold reasoning levels into one model")
-    p.add_argument("--no-link", action="store_true", help="Don't share skills, plugins, agents, etc. or settings from ~/.claude")
-    p.add_argument("--link-only", action="store_true", help="Only (re)share skills, plugins, agents, etc. and settings from ~/.claude, then exit")
+    p.add_argument("--no-link", action="store_true", help="Don't link the folder to ~/.claude (skills, plugins, agents, projects, settings, ...)")
+    p.add_argument("--link-only", action="store_true", help="Only (re)link the folder to ~/.claude and share settings, then exit")
     p.add_argument("-y", "--yes", action="store_true", help="No questions: use flags/defaults")
     p.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")

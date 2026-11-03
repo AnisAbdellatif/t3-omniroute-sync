@@ -64,17 +64,32 @@ class AssetLinking(unittest.TestCase):
             linked2 = sync.link_shared_assets(dst, source_path=src)
             self.assertEqual(linked2, [])
 
-    def test_replaces_real_dir_and_keeps_symlinks(self):
+    def test_links_everything_but_local_state(self):
         import tempfile
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
-            os.makedirs(os.path.join(src, "plugins"))
-            os.makedirs(os.path.join(src, "agents"))
-            os.makedirs(os.path.join(dst, "plugins"))  # created by Claude in the folder
+            for d in ("plugins/cache", "projects/p1", "sessions", "agents"):
+                os.makedirs(os.path.join(src, d))
+            for f in ("history.jsonl", "remote-settings.json", "settings.json"):
+                open(os.path.join(src, f), "w").close()
+            os.makedirs(os.path.join(dst, "plugins", "cache"))
+            open(os.path.join(dst, "plugins", "cache", "new.json"), "w").close()  # moved into src
+            open(os.path.join(dst, "plugins", "x.json"), "w").close()
+            open(os.path.join(src, "plugins", "x.json"), "w").close()  # conflict: kept in .bak
+            os.makedirs(os.path.join(dst, "projects", "p2"))
+            os.makedirs(os.path.join(dst, "todos"))  # only in dst: moved into src
+            os.makedirs(os.path.join(dst, "sessions"))
             os.symlink(src, os.path.join(dst, "agents"))  # user's own link: untouched
             linked = sync.link_shared_assets(dst, source_path=src)
-            self.assertEqual(linked, ["plugins"])
-            self.assertEqual(os.path.realpath(os.path.join(dst, "plugins")), os.path.realpath(os.path.join(src, "plugins")))
-            self.assertEqual(len([n for n in os.listdir(dst) if n.startswith("plugins.bak.")]), 1)
+            self.assertEqual(linked, ["history.jsonl", "plugins", "projects", "todos"])
+            for item in linked:
+                self.assertEqual(os.path.realpath(os.path.join(dst, item)), os.path.realpath(os.path.join(src, item)))
+            self.assertTrue(os.path.exists(os.path.join(src, "plugins", "cache", "new.json")))
+            self.assertTrue(os.path.isdir(os.path.join(src, "projects", "p2")))
+            baks = [n for n in os.listdir(dst) if n.startswith("plugins.bak.")]
+            self.assertEqual(os.listdir(os.path.join(dst, baks[0])), ["x.json"])
+            self.assertFalse(any(n.startswith("projects.bak.") for n in os.listdir(dst)))
+            self.assertFalse(os.path.islink(os.path.join(dst, "sessions")))
+            self.assertFalse(os.path.lexists(os.path.join(dst, "remote-settings.json")))
             self.assertEqual(os.readlink(os.path.join(dst, "agents")), src)
 
     def test_share_settings_keeps_local_keys(self):

@@ -44,8 +44,8 @@ Checklist keys: `↑`/`↓` move, `space` ticks, `a` all, `n` none, `/` search, 
 |---|---|
 | `~/.t3/userdata/settings.json` | Adds or updates an `omniroute` provider instance (backup: `settings.json.bak.<time>`, last 10 kept). Other settings are preserved. |
 | `<folder>/settings.json` | Holds `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. The file is mode `600` and the folder mode `700`. |
-| `<folder>/{skills,commands,agents,plugins,hooks,output-styles,CLAUDE.md,keybindings.json}` | Automatically symlinked from `~/.claude` (whichever exist) so your skills, slash commands, agents, plugins, hooks and instructions remain available. A real file/folder in the way is moved to `<name>.bak.<timestamp>`; existing symlinks are left alone. |
-| `<folder>/settings.json` (shared keys) | Every `~/.claude/settings.json` key except `env`, `model` and `apiKeyHelper` (e.g. `enabledPlugins`, `extraKnownMarketplaces`, `hooks`, `statusLine`) is copied in on each run, so plugins and hooks work the same. |
+| `<folder>/*` | Everything in `~/.claude` (skills, commands, agents, plugins, hooks, projects/memory, history, `CLAUDE.md`, ...) is symlinked in, so `~/.claude` is the single place to set things up. Items only in the folder are moved into `~/.claude`; a real folder in the way is merged into it (conflicting leftovers go to `<name>.bak.<timestamp>`). Not linked: `settings.json` and other `settings.*` files (e.g. a `settings.private.json` with secrets), `.claude.json`, `.credentials.json`, `policy-limits*`, `remote-settings*`, and runtime caches (`sessions`, `session-env`, `shell-snapshots`, `cache`, `telemetry`, `backups`, `statsig`). |
+| `<folder>/settings.json` (shared keys) | Holds the OmniRoute connection. Every other `~/.claude/settings.json` key (all but `env`, `model`, `apiKeyHelper`, e.g. `enabledPlugins`, `extraKnownMarketplaces`, `hooks`, `statusLine`) is copied in on each run. |
 
 ## Name styles
 
@@ -77,8 +77,8 @@ OmniRoute lists reasoning variants as separate models (`-low`, `-medium`, `-high
 | `--models REGEX` | Only model ids matching this regex (default: Claude models) |
 | `--all` | Every model of the chosen providers |
 | `--home-path DIR` | Claude config folder (default `~/claude_omniroute`) |
-| `--no-link` | Don't share skills, plugins, agents, etc. or settings from `~/.claude` |
-| `--link-only` | Only (re)share skills, plugins, agents, etc. and settings from `~/.claude`, then exit (no OmniRoute/T3 changes) |
+| `--no-link` | Don't link the folder to `~/.claude` or share its settings |
+| `--link-only` | Only (re)link the folder to `~/.claude` and share settings, then exit (no OmniRoute/T3 changes). Run after changing `~/.claude/settings.json` |
 | `--source-tag STYLE` | `prefix`, `short-prefix`, `suffix`, `short-suffix` or `none` |
 | `--no-group` | Don't fold reasoning levels into one model |
 | `--version` | Print the version |
