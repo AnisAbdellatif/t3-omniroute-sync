@@ -117,5 +117,16 @@ class AssetLinking(unittest.TestCase):
             self.assertEqual(os.path.realpath(top_typst), os.path.realpath(typst_dir))
 
 
+class CustomModels(unittest.TestCase):
+    def test_custom_models_parsed(self):
+        import io, json
+        from unittest import mock
+        body = json.dumps({"models": {"antigravity": [{"id": "gemini-4-argon", "source": "manual"}]}}).encode()
+        with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(body)):
+            self.assertEqual(sync.fetch_custom_models("http://x", "k"), ["antigravity/gemini-4-argon"])
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            self.assertEqual(sync.fetch_custom_models("http://x", "k"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

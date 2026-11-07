@@ -288,9 +288,22 @@ def fetch_models(base_url: str, api_key: str, timeout: float = 15.0) -> List[str
     if not isinstance(rows, list):
         raise OmniRouteError("Unexpected response from /v1/models.")
     ids = sorted({r["id"] if isinstance(r, dict) else str(r) for r in rows if (isinstance(r, dict) and r.get("id")) or isinstance(r, str)})
+    ids = sorted(set(ids) | set(fetch_custom_models(base_url, api_key, timeout)))
     if not ids:
         raise OmniRouteError("OmniRoute returned 0 models. Connect a provider in the OmniRoute dashboard first.")
     return ids
+
+
+def fetch_custom_models(base_url: str, api_key: str, timeout: float = 15.0) -> List[str]:
+    """Models added by hand in the OmniRoute dashboard; /v1/models leaves them out but they are served."""
+    req = urllib.request.Request(base_url + "/api/provider-models",
+                                 headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            models = json.loads(resp.read().decode("utf-8", "replace")).get("models") or {}
+        return [f"{prov}/{m['id']}" for prov, ms in models.items() for m in ms if isinstance(m, dict) and m.get("id")]
+    except (urllib.error.URLError, OSError, ValueError, AttributeError, TypeError):
+        return []  # older OmniRoute or no access: the /v1/models list is still usable
 
 
 # --------------------------------------------------------------------------- #
@@ -448,7 +461,7 @@ def write_claude_home(home_path: str, base_url: str, api_key: str) -> str:
     env = settings.setdefault("env", {})
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = api_key
-    env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+    env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "0"  # only the models picked in the wizard
     if os.path.exists(path):
         backup_file(path, keep=3)
     write_json_atomic(path, settings, mode=0o600)  # holds the API key
@@ -547,7 +560,7 @@ def share_settings(home_path: str, source_path: str = "~/.claude") -> List[str]:
 
 def build_instance(existing: Dict[str, Any], base_url: str, home_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Update (or create) the T3 provider instance, preserving unrelated user settings."""
-    wanted = {"ANTHROPIC_BASE_URL": base_url, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}
+    wanted = {"ANTHROPIC_BASE_URL": base_url, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "0"}
     env = [dict(e) for e in existing.get("environment", [])]
     for name, value in wanted.items():
         for e in env:
